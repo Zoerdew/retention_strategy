@@ -1,65 +1,72 @@
-from flask import Flask, request, jsonify
+import os
 import json
-import google.auth
+import datetime
+from flask import Flask, request, jsonify
+from google.oauth2 import service_account
 from googleapiclient.discovery import build
-from google.oauth2.service_account import Credentials
-from googleapiclient.errors import HttpError
 
+# --- Flask setup ---
 app = Flask(__name__)
 
-# Google Drive and Docs setup
-SCOPES = ['https://www.googleapis.com/auth/drive', 'https://www.googleapis.com/auth/documents']
-SERVICE_ACCOUNT_FILE = 'service_account.json'
+# --- Load credentials from env variable ---
+SCOPES = ['https://www.googleapis.com/auth/drive']
+service_account_info = json.loads(os.environ["SERVICE_ACCOUNT_JSON"])
+creds = service_account.Credentials.from_service_account_info(service_account_info, scopes=SCOPES)
 
-TEMPLATE_DOCUMENT_ID = '1vO4MGHF_q4ATTE0Qe4snCuGALmBUgJdmiZjmiQQqlFc'
-DESTINATION_FOLDER_ID = '1m0E2RqE0U9TbEvLYDLN2KzLzy1Th93_C'
+# --- Google Drive + Docs setup ---
+DRIVE = build('drive', 'v3', credentials=creds)
+DOCS = build('docs', 'v1', credentials=creds)
 
-creds = Credentials.from_service_account_file(SERVICE_ACCOUNT_FILE, scopes=SCOPES)
-docs_service = build('docs', 'v1', credentials=creds)
-drive_service = build('drive', 'v3', credentials=creds)
+TEMPLATE_ID = '1vO4MGHF_q4ATTE0Qe4snCuGALmBUgJdmiZjmiQQqlFc'  # Your template doc ID
+FOLDER_ID = '1m0E2RqE0U9TbEvLYDLN2KzLzy1Th93_C'                # Your target folder ID
 
 @app.route('/trigger', methods=['POST'])
-def trigger():
+def generate_strategy_doc():
     data = request.get_json()
 
     if not data:
-        return jsonify({'error': 'Missing JSON data'}), 400
+        return jsonify({"error": "No JSON body provided"}), 400
 
-    try:
-        # Copy template
-        copied_file = drive_service.files().copy(
-            fileId=TEMPLATE_DOCUMENT_ID,
-            body={
-                'name': f"Loyalty Strategy – {data.get('primary_loyalty_style', 'Untitled')}",
-                'parents': [DESTINATION_FOLDER_ID]
+    customer_name = data.get("customer_name", "Unnamed")
+    title = f"{customer_name} | Loyalty & Retention Strategy"
+
+    # Step 1: Copy the template
+    copied_file = DRIVE.files().copy(
+        fileId=TEMPLATE_ID,
+        body={
+            'name': title,
+            'parents': [FOLDER_ID]
+        }
+    ).execute()
+
+    document_id = copied_file.get('id')
+
+    # Step 2: Format replacement requests
+    requests = []
+    for key, value in data.items():
+        placeholder = f"{{{{{key}}}}}"  # double curly braces
+        requests.append({
+            'replaceAllText': {
+                'containsText': {
+                    'text': placeholder,
+                    'matchCase': True
+                },
+                'replaceText': value
             }
-        ).execute()
+        })
 
-        document_id = copied_file['id']
-
-        # Replace placeholders
-        requests = []
-        for placeholder, value in data.items():
-            requests.append({
-                'replaceAllText': {
-                    'containsText': {
-                        'text': f"{{{{{placeholder}}}}}",
-                        'matchCase': True
-                    },
-                    'replaceText': value
-                }
-            })
-
-        docs_service.documents().batchUpdate(
+    # Step 3: Apply replacements
+    if requests:
+        DOCS.documents().batchUpdate(
             documentId=document_id,
             body={'requests': requests}
         ).execute()
 
-        doc_link = f"https://docs.google.com/document/d/{document_id}/edit"
-        return jsonify({'status': 'success', 'doc_link': doc_link})
-
-    except HttpError as error:
-        return jsonify({'error': f"❌ Google API error: {error}"}), 500
+    return jsonify({
+        "message": "Document created successfully.",
+        "document_id": document_id,
+        "document_url": f"https://docs.google.com/document/d/{document_id}/edit"
+    })
 
 if __name__ == '__main__':
     app.run(debug=True)
